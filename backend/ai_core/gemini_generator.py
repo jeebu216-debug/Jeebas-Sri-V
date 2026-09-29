@@ -46,15 +46,20 @@ or legally enforceable.
     def __init__(self) -> None:
         settings = get_settings()
 
-        if not settings.gemini_api_key:
+        api_key = (settings.gemini_api_key or "").strip()
+
+        # Vercel/AI Studio values are sometimes pasted with quotes.
+        # Remove only matching surrounding quotes; never alter the key body.
+        if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in {"'", '"'}:
+            api_key = api_key[1:-1].strip()
+
+        if not api_key:
             raise RuntimeError(
                 "GEMINI_API_KEY is missing. "
-                "Add it to your .env file."
+                "Add it to the deployment environment variables."
             )
 
-        self.client = genai.Client(
-            api_key=settings.gemini_api_key
-        )
+        self.client = genai.Client(api_key=api_key)
 
         self.primary_model = settings.gemini_model
         self.fallback_model = "gemini-flash-lite-latest"
