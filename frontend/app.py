@@ -11,10 +11,25 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-BACKEND_URL = os.getenv(
-    "BACKEND_URL",
-    "http://127.0.0.1:8000"
-).rstrip("/")
+def get_backend_url() -> str:
+    # Streamlit Cloud: set BACKEND_URL in App Settings -> Secrets.
+    # Local development: use BACKEND_URL from .env when available.
+    secret_url = ""
+    try:
+        secret_url = str(st.secrets.get("BACKEND_URL", "")).strip()
+    except Exception:
+        pass
+
+    env_url = os.getenv("BACKEND_URL", "").strip()
+
+    return (
+        secret_url
+        or env_url
+        or "http://127.0.0.1:8000"
+    ).rstrip("/")
+
+
+BACKEND_URL = get_backend_url()
 
 
 # =========================================================
