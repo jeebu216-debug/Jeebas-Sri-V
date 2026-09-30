@@ -1,3 +1,4 @@
+import random
 import time
 
 from google import genai
@@ -43,6 +44,9 @@ or legally enforceable.
 12. Do not fabricate information.
 """
 
+    # Transient Gemini errors that are safe to retry.
+    RETRYABLE_ERROR_CODES = ("408", "429", "500", "502", "503", "504")
+
     def __init__(self) -> None:
         settings = get_settings()
 
@@ -50,7 +54,11 @@ or legally enforceable.
 
         # Vercel/AI Studio values are sometimes pasted with quotes.
         # Remove only matching surrounding quotes; never alter the key body.
-        if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in {"'", '"'}:
+        if (
+            len(api_key) >= 2
+            and api_key[0] == api_key[-1]
+            and api_key[0] in {"'", '"'}
+        ):
             api_key = api_key[1:-1].strip()
 
         if not api_key:
@@ -62,7 +70,71 @@ or legally enforceable.
         self.client = genai.Client(api_key=api_key)
 
         self.primary_model = settings.gemini_model
-        self.fallback_model = "gemini-flash-lite-latest"
+
+        # Keep multiple independent fallback choices.
+        self.fallback_models = [
+            "gemini-3.7-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-flash-lite-latest",
+        ]
+
+    @classmethod
+    def _is_retryable_error(cls, exc: Exception) -> bool:
+        error_text = str(exc).upper()
+        return (
+            any(code in error_text for code in cls.RETRYABLE_ERROR_CODES)
+            or "UNAVAILABLE" in error_text
+            or "RESOURCE_EXHAUSTED" in error_text
+            or "DEADLINE_EXCEEDED" in error_text
+        )
+
+    @staticmethod
+    def _backoff_delay(attempt: int) -> float:
+        # 2s, 4s, 8s with small jitter to avoid synchronized retries.
+        base_delay = 2 ** (attempt + 1)
+        jitter = random.uniform(0, 0.5)
+        return base_delay + jitter
+
+    def _generate_with_retries(self, model: str, prompt: str) -> str:
+        max_attempts = 3
+        last_error = None
+
+        for attempt in range(max_attempts):
+            try:
+                response = self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        temperature=0.3,
+                        max_output_tokens=6000,
+                    ),
+                )
+
+                text = getattr(response, "text", None)
+
+                if not text:
+                    raise RuntimeError(
+                        f"Gemini model '{model}' returned an empty response."
+                    )
+
+                return text.strip()
+
+            except Exception as exc:
+                last_error = exc
+
+                # Do not retry permanent errors such as invalid API keys,
+                # malformed requests, permission errors, etc.
+                if not self._is_retryable_error(exc):
+                    raise
+
+                if attempt < max_attempts - 1:
+                    time.sleep(self._backoff_delay(attempt))
+
+        raise RuntimeError(
+            f"Model '{model}' remained unavailable after "
+            f"{max_attempts} attempts. Details: {last_error}"
+        )
 
     def generate_document(
         self,
@@ -109,56 +181,24 @@ Do not add facts that the user did not provide.
 Use [MISSING INFORMATION] wherever necessary.
 """
 
-        models_to_try = [
-            self.primary_model,
-            self.fallback_model,
-        ]
+        # Try the configured primary model first, followed by several
+        # independent fallback models. Duplicate model names are removed.
+        models_to_try = []
+        for model in [self.primary_model, *self.fallback_models]:
+            if model and model not in models_to_try:
+                models_to_try.append(model)
 
-        last_error = None
+        errors = []
 
         for model in models_to_try:
-
-            for attempt in range(2):
-
-                try:
-                    response = self.client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=self.SYSTEM_INSTRUCTION,
-                            temperature=0.3,
-                            max_output_tokens=6000,
-                        ),
-                    )
-
-                    text = getattr(response, "text", None)
-
-                    if not text:
-                        raise RuntimeError(
-                            "Gemini returned an empty response."
-                        )
-
-                    return text.strip()
-
-                except Exception as exc:
-                    last_error = exc
-                    error_text = str(exc)
-
-                    is_temporary_error = (
-                        "503" in error_text
-                        or "UNAVAILABLE" in error_text
-                        or "429" in error_text
-                    )
-
-                    if not is_temporary_error:
-                        raise
-
-                    if attempt == 0:
-                        time.sleep(3)
+            try:
+                return self._generate_with_retries(model, prompt)
+            except Exception as exc:
+                errors.append(f"{model}: {exc}")
 
         raise RuntimeError(
             "Gemini is temporarily unavailable. "
-            "LegalEase tried the primary and fallback models. "
+            "LegalEase tried multiple models with automatic retries. "
             "Please try again in a few moments. "
-            f"Details: {last_error}"
+            f"Details: {' | '.join(errors)}"
         )
